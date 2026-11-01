@@ -67,7 +67,7 @@ function capture(s, { force = false, fresh = false } = {}) {
   let projects = [];
   const res = withLock(`session-${key}`, () => {
     if (fs.existsSync(dir)) projects = listProjects(dir);
-    const sum = summarise(s, s.events, { since: prev?.at, fallbackModel: cfg.fallback_model, preferFresh: !useFork, projects });
+    const sum = summarise(s, s.events, { since: prev?.at, fallbackModel: cfg.fallback_model, preferFresh: !useFork, projects, allowSkip: userTurns(s) < 5 });
     if (sum.error) return { error: sum.error };
     const anchor = lastEvent(s)?.id;
     if (sum.skip) { updateState(key, { anchor, at: new Date().toISOString(), skipped: true }); return { skip: 'model said SKIP' }; }
