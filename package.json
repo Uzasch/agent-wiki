@@ -1,0 +1,13 @@
+{
+  "name": "agent-wiki",
+  "version": "0.1.0",
+  "description": "Git-backed OKF wiki of what you did with Claude Code, Codex, opencode and omp — across projects, machines and the team.",
+  "type": "module",
+  "bin": { "agent-wiki": "bin/agent-wiki.mjs" },
+  "files": ["bin", "lib", "skill", "adapters", "DESIGN.md"],
+  "engines": { "node": ">=20" },
+  "dependencies": { "smol-toml": "^1.3.1" },
+  "scripts": { "test": "node --test test/" },
+  "license": "MIT",
+  "private": true
+}
