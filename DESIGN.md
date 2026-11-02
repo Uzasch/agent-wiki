@@ -43,7 +43,7 @@ Vault choice for a session, first match wins: `/set-wiki` in the session → `[f
 ```
 index.md                       one line per page; agents read this first
 log/<machine>/YYYY-MM.md       dated line per session; one writer per file
-sessions/YYYY-MM-DD-<tool>-<id8>.md   type: Session
+sessions/YYYY-MM-DD-<short>-<id8>.md  type: Session (<short> = 2-5 word slug; <id8> = session id start)
 meetings/YYYY-MM-DD-<slug>.md         type: Meeting
 discussions/<slug>.md                 type: Discussion (status, owner, dated sections)
 projects/<name>.md                    type: Project (decisions with dates + links)
@@ -67,7 +67,7 @@ start: ... / end: ...
 status: done | in-progress
 anchor: <uuid of last event covered>
 meetings: [{path, link: sure|likely}]
-outputs: [{kind, url, local}]
+outputs: [{kind, url}]   # found by scanning the raw record, not by the model
 ```
 
 ## Capture (automatic)
@@ -86,6 +86,21 @@ Summariser:
 - Output markers `@@TITLE@@ @@STATUS@@ @@LOG@@ @@DECISIONS@@ @@HOWTO@@ @@OUTPUTS@@`; one retry;
   `SKIP` allowed. Skip sessions under 3 turns.
 
+Deterministic outputs (no model, no cost):
+- The raw record (tool inputs, tool results, assistant text) is scanned for claude.ai artifact links,
+  Google Docs/Sheets/Slides/Drive links, GitHub PR/issue/commit links, links a creating command
+  printed, and absolute paths under `/mnt/`. Deduped, capped at 40, merged into `## Outputs`
+  (model bullets kept; missing ones added as `- link:` / `- path:`) and the `outputs:` frontmatter.
+- Image files (png/jpg/webp, 20 KB - 5 MB, still on disk) the session wrote or looked at: the newest 5
+  go to the vault's Drive folder (when the vault has `drive`) and are embedded under `## Screenshots`.
+  An upload error is logged; it never fails the capture.
+- A recapture keeps the page's existing path (found by session id), so one session is one file.
+
+Writing style: every page is written for a reader who is not an engineer. Line 1 gives context; then
+ASD-STE100 Simplified Technical English; the project's domain words come from its `GLOSSARY.md`
+(`GLOSSARY-MAP.md` -> the right one), found by walking up from the session folder to the git root.
+Only the entries whose term or `_Avoid_` word appears in the session text go into the prompt (cap ~12 KB).
+
 Safety:
 - Loop guard: env `AGENT_WIKI_RUNNING=1` set on the summariser; every hook exits if set.
 - Per-session `mkdir` lock (stale after 5 min); per-vault lock for git.
@@ -100,7 +115,16 @@ Safety:
 - Page: date, attendees, summary, decisions, action items, link to Wispr.
 - Linking both ways: sure (session opened/named the meeting) or likely (same project+topic within
   ~7 days). Action item done in a session → marked done with a link.
-- Risk to verify first: Wispr is a claude.ai connector; check it works from a headless run.
+- Wispr is a claude.ai connector; a headless run can start before it is connected ("still
+  connecting"). The list call is retried 3 times, 45 s apart; then the import fails with a clear
+  reason kept in state, and `agent-wiki status` shows "meetings: last import failed <time>: <reason>".
+
+## Reading the wiki (automatic)
+`agent-wiki hook claude-prompt` / `codex-prompt` run on every prompt (UserPromptSubmit; same JSON in
+and out for both agents). A model-free keyword search over page titles, descriptions, projects and
+tags prints up to 3 related pages as `additionalContext`. It prints nothing for slash commands,
+prompts under 4 words, weak matches, or the session's own page. A small cache (page size + mtime)
+keeps it fast on a big vault.
 
 ## Discussions (manual, via the skill)
 "save this discussion" → `discussions/<slug>.md` (points, decisions, open questions, next steps,

@@ -12,6 +12,10 @@ A git-backed markdown wiki of what you did with coding agents — Claude Code, C
 - **Projects organize themselves:** pages are assigned to projects automatically, with one hub page
   per project (timeline, decisions, open items).
 - **Meetings:** daily import from Wispr Flow, linked to the sessions they relate to.
+- **Links and screenshots, automatically:** artifact, Sheets/Docs, GitHub and `/mnt/` links are found in
+  the raw record, and the newest screenshots go to Drive. No model needed.
+- **Agents read the wiki on their own:** a prompt hook shows related past pages (Claude Code and Codex).
+- **Plain writing:** pages use simple technical English and the project's own glossary words.
 - **Images:** stored on Google Drive, embedded from a local copy.
 - **Secrets** are redacted before anything is written.
 
@@ -23,6 +27,9 @@ node bin/agent-wiki.mjs install --dry-run   # see what it will change
 node bin/agent-wiki.mjs install
 agent-wiki vault new work your-org/wiki-work
 ```
+
+`agent-wiki migrate-names [--vault N] [--dry-run]` gives old session pages a short title in the file
+name and fixes every link to them.
 
 Settings live in `~/.wiki/config.toml`. Design and decisions: [DESIGN.md](DESIGN.md).
 
