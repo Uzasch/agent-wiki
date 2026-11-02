@@ -5,7 +5,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { userSlug } from '../lib/wispr.mjs';
+import { readList } from '../lib/meetings.mjs';
 import { makeRemote, fakeBin, sh, FAKE_CLAUDE, FAKE_SYSTEMCTL, MCP } from './fakes.mjs';
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'agent-wiki.mjs');
@@ -17,10 +20,11 @@ const MEETINGS = JSON.stringify([
 
 // One machine: its own agent-wiki home, its own clone of the vault, its own log of fake `claude` calls.
 let count = 0;
-function machine(name, vaultDir) {
+// `user` = the Wispr user as the config says (`wispr_user`); null = not set, so git's email or the OS user name is used.
+function machine(name, vaultDir, user = null) {
   const wiki = path.join(SCRATCH, 'machines', `${count++}-${name}`);
   fs.mkdirSync(path.join(wiki, 'wiki'), { recursive: true });
-  fs.writeFileSync(path.join(wiki, 'wiki', 'config.toml'), `default = "work"\nmachine = "${name}"\n[vaults.work]\npath = "${vaultDir}"\n`);
+  fs.writeFileSync(path.join(wiki, 'wiki', 'config.toml'), `default = "work"\nmachine = "${name}"\n${user ? `wispr_user = "${user}"\n` : ''}[vaults.work]\npath = "${vaultDir}"\n`);
   const claudeLog = path.join(wiki, 'claude.log');
   const run = (args, { mcp = MCP.connector, extra = {}, home: h } = {}) => {
     const r = spawnSync(process.execPath, [BIN, ...args], { encoding: 'utf8', env: {
@@ -33,12 +37,26 @@ function machine(name, vaultDir) {
   return { run, modelCalls, vaultDir, wiki };
 }
 
+const remoteFile = (bare, rel) => sh('git', ['--git-dir', bare, 'show', `main:${rel}`]);
+
+// Two machines of ONE person (both import as "ann").
 function twoMachines() {
   const r = makeRemote();
-  const a = machine('machine-a', r.clone('a'));
-  const b = machine('machine-b', r.clone('b'));
-  const remoteRun = () => JSON.parse(sh('git', ['--git-dir', r.bare, 'show', 'main:.agent-wiki/meetings.json']));
+  const a = machine('machine-a', r.clone('a'), 'ann');
+  const b = machine('machine-b', r.clone('b'), 'ann');
+  const remoteRun = (user = 'ann') => JSON.parse(remoteFile(r.bare, `.agent-wiki/meetings/${user}.json`));
   return { a, b, remoteRun };
+}
+
+// Two people: Ann on two machines, Bob on one. All three share one vault.
+function twoPeople() {
+  const r = makeRemote();
+  const a1 = machine('machine-a1', r.clone('a1'), 'ann');
+  const a2 = machine('machine-a2', r.clone('a2'), 'ann');
+  const b1 = machine('machine-b1', r.clone('b1'), 'bob');
+  const remoteRun = (user) => JSON.parse(remoteFile(r.bare, `.agent-wiki/meetings/${user}.json`));
+  const remoteFiles = () => sh('git', ['--git-dir', r.bare, 'ls-tree', '-r', '--name-only', 'main']).split('\n');
+  return { a1, a2, b1, remoteRun, remoteFiles, bare: r.bare };
 }
 
 test('A imports and records it; B (also logged in) skips with a reason and makes no model call', () => {
@@ -134,11 +152,94 @@ test('status: last import and machine from the vault, and this machine\'s login'
   assert.match(no.out, /meetings: Wispr login on this machine: no \(no Wispr Flow server in claude mcp list\)/);
 });
 
+test('status says which user this machine imports as, and where the name came from', () => {
+  const r = makeRemote();
+  const withConfig = machine('cfg', r.clone('c1'), 'ann');
+  assert.match(withConfig.run(['status']).out, /^meetings: this machine imports as ann \(from config wispr_user\)$/m);
+
+  const plain = machine('plain', r.clone('c2'));
+  const gitFile = path.join(SCRATCH, 'gitconfig-ann');
+  fs.writeFileSync(gitFile, '[user]\n\temail = Ann.Lee@example.com\n');
+  assert.match(plain.run(['status'], { extra: { GIT_CONFIG_GLOBAL: gitFile } }).out,
+    /^meetings: this machine imports as ann-lee-example-com \(from git config --global user\.email\)$/m);
+
+  const osName = userSlug(os.userInfo().username);
+  assert.match(plain.run(['status']).out, new RegExp(`^meetings: this machine imports as ${osName} \\(from OS user name\\)$`, 'm'));
+});
+
 test('status still shows a failed import with its time and reason', () => {
   const { b } = twoMachines();
   fs.mkdirSync(path.join(b.wiki, 'wiki', 'state'), { recursive: true });
   fs.writeFileSync(path.join(b.wiki, 'wiki', 'state', 'sessions.json'), JSON.stringify({ meetings: { failed_at: '2026-03-01T08:00:00.000Z', failed_reason: 'Wispr connector not ready after 4 tries' } }));
   assert.match(b.run(['status']).out, /meetings: last import failed 2026-03-01T08:00:00.000Z: Wispr connector not ready after 4 tries/);
+});
+
+// ---------- one record per person ----------
+test('Ann and Bob on separate machines both import the same day; Ann\'s second machine skips; Bob is not blocked', () => {
+  const { a1, a2, b1, remoteRun, remoteFiles, bare } = twoPeople();
+  const ra = a1.run(['meetings', 'import']);
+  assert.equal(ra.status, 0, ra.stderr + ra.out);
+  assert.equal(JSON.parse(ra.out).pages.length, 2);
+
+  const rb = b1.run(['meetings', 'import']);
+  assert.equal(rb.status, 0, rb.stderr + rb.out);
+  const bobRes = JSON.parse(rb.out);   // a JSON result, not "already imported by ..."
+  assert.equal(bobRes.pages.length, 2);
+  assert.ok(b1.modelCalls().length > 0, 'Bob\'s machine did the work');
+  assert.ok(bobRes.pages.every((p) => p.isNew === false && p.joined === 'bob'), 'both meetings already had a page: Bob was added to it');
+
+  const rs = a2.run(['meetings', 'import']);
+  assert.equal(rs.status, 0, rs.stderr);
+  assert.match(rs.out, /^meetings: already imported by machine-a1 at 20\d\d-.*Z \(use --force to run anyway\)$/);
+  assert.equal(a2.modelCalls().length, 0, 'Ann\'s second machine did no work');
+
+  assert.deepEqual(remoteFiles().filter((f) => f.startsWith('.agent-wiki/')), ['.agent-wiki/meetings/ann.json', '.agent-wiki/meetings/bob.json']);
+  assert.equal(remoteRun('ann').machine, 'machine-a1');
+  assert.equal(remoteRun('bob').machine, 'machine-b1');
+  const pages = remoteFiles().filter((f) => /^meetings\/.*\.md$/.test(f));
+  assert.equal(pages.length, 2, 'two meetings, two pages: the shared meetings did not get a second page');
+  for (const f of pages) assert.deepEqual(readList(remoteFile(bare, f), 'recorded_by'), ['ann', 'bob'], f);
+});
+
+test('a second run of Bob\'s other machine is blocked by Bob\'s record, not by Ann\'s', () => {
+  const r = makeRemote();
+  const a = machine('machine-a', r.clone('a'), 'ann');
+  const b1 = machine('machine-b1', r.clone('b1'), 'bob');
+  const b2 = machine('machine-b2', r.clone('b2'), 'bob');
+  assert.equal(b1.run(['meetings', 'import']).status, 0);
+  assert.match(b2.run(['meetings', 'import']).out, /^meetings: already imported by machine-b1 /);
+  assert.equal(JSON.parse(a.run(['meetings', 'import']).out).pages.length, 2, 'Ann is not blocked');
+});
+
+test('an old vault with one shared record: the first user to run takes it over (same reading point), and the old file is gone', () => {
+  const { a1, b1, remoteRun, remoteFiles } = twoPeople();
+  const seed = a1.vaultDir;
+  fs.mkdirSync(path.join(seed, '.agent-wiki'), { recursive: true });
+  fs.writeFileSync(path.join(seed, '.agent-wiki', 'meetings.json'), JSON.stringify({ last_run: '2026-10-01T08:00:00.000Z', machine: 'old-machine', last_meeting_start: '2026-11-01T15:00:00Z' }));
+  sh('git', ['-C', seed, 'add', '-A']); sh('git', ['-C', seed, 'commit', '-q', '-m', 'old shared record']); sh('git', ['-C', seed, 'push', '-q']);
+
+  const ra = a1.run(['meetings', 'import']);
+  assert.equal(ra.status, 0, ra.stderr + ra.out);
+  assert.match(a1.modelCalls().find((c) => /search_meetings/.test(c[1]))[1], /started after 2026-10-31T15:00:00\.000Z/, 'Ann reads from the old record\'s point');
+  assert.deepEqual(remoteFiles().filter((f) => f.startsWith('.agent-wiki/')), ['.agent-wiki/meetings/ann.json'], 'the old file is removed');
+  assert.equal(remoteRun('ann').machine, 'machine-a1');
+
+  const rb = b1.run(['meetings', 'import']);
+  assert.equal(rb.status, 0, rb.stderr + rb.out);
+  assert.equal(JSON.parse(rb.out).pages.length, 2, 'Bob has his own record: not blocked');
+  assert.equal(remoteRun('bob').machine, 'machine-b1');
+});
+
+test('a dry run on an old vault reads the old record and moves nothing', () => {
+  const { a1, remoteFiles } = twoPeople();
+  fs.mkdirSync(path.join(a1.vaultDir, '.agent-wiki'), { recursive: true });
+  fs.writeFileSync(path.join(a1.vaultDir, '.agent-wiki', 'meetings.json'), JSON.stringify({ last_run: '2026-10-01T08:00:00.000Z', machine: 'old-machine', last_meeting_start: '2026-11-01T15:00:00Z' }));
+  sh('git', ['-C', a1.vaultDir, 'add', '-A']); sh('git', ['-C', a1.vaultDir, 'commit', '-q', '-m', 'old shared record']); sh('git', ['-C', a1.vaultDir, 'push', '-q']);
+  const r = a1.run(['meetings', 'import', '--dry-run']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(a1.modelCalls().find((c) => /search_meetings/.test(c[1]))[1], /started after 2026-10-31T15:00:00\.000Z/);
+  assert.ok(remoteFiles().includes('.agent-wiki/meetings.json'));
+  assert.ok(fs.existsSync(path.join(a1.vaultDir, '.agent-wiki', 'meetings.json')));
 });
 
 // ---------- install ----------

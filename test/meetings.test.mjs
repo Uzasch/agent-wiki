@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { fetchMeetings, importMeetings, isNotReady } from '../lib/meetings.mjs';
+import { fetchMeetings, importMeetings, isNotReady, writeMeetingPage, readList } from '../lib/meetings.mjs';
 import { initVault } from '../lib/vault.mjs';
 import { fakeBin, FAKE_CLAUDE, MCP } from './fakes.mjs';
 
@@ -109,4 +109,69 @@ test('a meeting that stays not ready after the last try is a failure the caller 
   const r = fetchMeetings({ ask, sleep: () => {} });
   assert.equal(r.meetings.length, 0);
   assert.match(r.failed[0], /^meeting m1: .*still connecting/);
+});
+
+// ---------- one page per meeting, whoever recorded it ----------
+const meeting = { id: 'w1', title: 'Team sync', start: '2026-11-01T10:00:00Z', end: null, attendees: [], summary: 'We talked.', decisions: [], actions: [], link: '', projectAnswer: '' };
+const pageIn = (dir) => fs.readdirSync(path.join(dir, 'meetings')).filter((f) => f.endsWith('.md'));
+
+test('two teammates who recorded the same meeting get one page (same wispr_id), listing both in recorded_by', () => {
+  const vault = mk('shared-vault', 'x').replace(/x$/, '');
+  initVault(vault);
+  const a = writeMeetingPage(vault, meeting, { user: 'ann' });
+  assert.equal(a.isNew, true);
+  const file = path.join(vault, a.rel);
+  assert.deepEqual(readList(fs.readFileSync(file, 'utf8'), 'recorded_by'), ['ann']);
+
+  const before = fs.readFileSync(file, 'utf8');
+  const b = writeMeetingPage(vault, { ...meeting, summary: 'Bob\'s version of the summary.' }, { user: 'bob' });
+  assert.equal(b.rel, a.rel, 'same page');
+  assert.equal(b.joined, true);
+  assert.equal(pageIn(vault).length, 1, 'one page, not two');
+  const after = fs.readFileSync(file, 'utf8');
+  assert.deepEqual(readList(after, 'recorded_by'), ['ann', 'bob']);
+  assert.equal(after.replace('  - "bob"\n', ''), before, 'nothing else on the page changed: it was not rewritten');
+
+  writeMeetingPage(vault, meeting, { user: 'bob' });   // Bob again (a late-edited meeting read twice): still one entry
+  assert.deepEqual(readList(fs.readFileSync(file, 'utf8'), 'recorded_by'), ['ann', 'bob']);
+});
+
+test('the same user reading a meeting again rewrites it (a late edit) and keeps recorded_by, sessions and project', () => {
+  const vault = mk('rewrite-vault', 'x').replace(/x$/, '');
+  initVault(vault);
+  const { rel } = writeMeetingPage(vault, meeting, { user: 'ann' });
+  writeMeetingPage(vault, meeting, { user: 'bob' });
+  const file = path.join(vault, rel);
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('project: ""', 'project: "alpha"'));
+  writeMeetingPage(vault, { ...meeting, summary: 'Edited later.' }, { user: 'ann' });
+  const text = fs.readFileSync(file, 'utf8');
+  assert.match(text, /Edited later\./);
+  assert.match(text, /^project: "alpha"$/m);
+  assert.deepEqual(readList(text, 'recorded_by'), ['ann', 'bob']);
+});
+
+test('a page from an older version (no recorded_by) is rewritten as before and gets the list; no user = no list', () => {
+  const vault = mk('legacy-page-vault', 'x').replace(/x$/, '');
+  initVault(vault);
+  const { rel } = writeMeetingPage(vault, meeting);
+  const file = path.join(vault, rel);
+  assert.doesNotMatch(fs.readFileSync(file, 'utf8'), /recorded_by/, 'a caller without a user writes the page as before');
+  const r = writeMeetingPage(vault, { ...meeting, summary: 'New text.' }, { user: 'bob' });
+  assert.equal(r.joined, false);
+  assert.match(fs.readFileSync(file, 'utf8'), /New text\./);
+  assert.deepEqual(readList(fs.readFileSync(file, 'utf8'), 'recorded_by'), ['bob']);
+});
+
+test('importMeetings: the second user\'s import of a shared meeting adds her and links nothing new', () => {
+  const vault = mk('import-two-vault', 'x').replace(/x$/, '');
+  initVault(vault);
+  const stub = { id: 'w1', title: 'Team sync', start: '2026-11-01T10:00:00Z' };
+  const ask = (prompt) => (/search_meetings/.test(prompt) ? { json: [stub] } : { json: { ...stub, summary: 'We talked.' } });
+  const first = importMeetings(vault, { ask, sleep: () => {}, user: 'ann' });
+  assert.equal(first.pages[0].isNew, true);
+  const second = importMeetings(vault, { ask, sleep: () => {}, user: 'bob' });
+  assert.equal(second.pages[0].isNew, false);
+  assert.equal(second.pages[0].joined, 'bob');
+  assert.equal(pageIn(vault).length, 1);
+  assert.deepEqual(readList(fs.readFileSync(path.join(vault, second.pages[0].rel), 'utf8'), 'recorded_by'), ['ann', 'bob']);
 });
