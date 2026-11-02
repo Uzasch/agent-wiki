@@ -25,6 +25,9 @@ New vault: `agent-wiki vault new <name> <owner/repo>` (clones the repo to `~/wik
 2. Open the matching pages. For a broad question, `grep -ril "<term>" <vault>` as well.
 3. Answer with the date, the decision and the reason, and link the page path.
 
+A hook may already have put "agent-wiki: related past work" lines in your context: those are pages
+that match the user's prompt. Open the ones that fit before you start; ignore the ones that do not.
+
 ## Save a discussion / meeting points
 
 When the user asks to save a discussion or types meeting points, write

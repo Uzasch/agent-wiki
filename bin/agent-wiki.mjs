@@ -2,20 +2,28 @@
 // agent-wiki — capture agent sessions into git-backed OKF vaults.
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import { loadConfig, saveConfig, resolveVault, rememberFolder, vaultPath, STATE_DIR, expand } from '../lib/config.mjs';
-import { readSession, findSession, listClaudeFiles, listCodexFiles, listAgyFiles, fileMtime, eventsAfter, userTurns, lastEvent, transcriptText } from '../lib/sessions.mjs';
-import { summarise } from '../lib/summarise.mjs';
-import { initVault, writeSessionPage, findSessionPage, syncVault } from '../lib/vault.mjs';
-import { listProjects, createProjectPage, organizeVault } from '../lib/projects.mjs';
-import { withLock, withLockAsync } from '../lib/lock.mjs';
-import { importClaudeMem } from '../lib/claudemem.mjs';
-import { addImage, pullImages } from '../lib/drive.mjs';
-import { importMeetings } from '../lib/meetings.mjs';
-import { finalizeOutputs, pickImages } from '../lib/outputs.mjs';
-import { buildScreenshots } from '../lib/screenshots.mjs';
-import { planRenames, applyRenames, renameInState, brokenLinks } from '../lib/migrate.mjs';
+
+// The prompt hook runs on every user prompt, so it is handled first, before the heavy modules load.
+if (process.argv[2] === 'hook' && /-prompt$/.test(process.argv[3] || '')) {
+  const { promptHook } = await import('../lib/hook.mjs');
+  await promptHook();
+  process.exit(0);
+}
+
+const { spawn, spawnSync } = await import('node:child_process');
+const { fileURLToPath } = await import('node:url');
+const { loadConfig, saveConfig, resolveVault, rememberFolder, vaultPath, STATE_DIR, expand } = await import('../lib/config.mjs');
+const { readSession, findSession, listClaudeFiles, listCodexFiles, listAgyFiles, fileMtime, eventsAfter, userTurns, lastEvent, transcriptText } = await import('../lib/sessions.mjs');
+const { summarise } = await import('../lib/summarise.mjs');
+const { initVault, writeSessionPage, findSessionPage, syncVault } = await import('../lib/vault.mjs');
+const { listProjects, createProjectPage, organizeVault } = await import('../lib/projects.mjs');
+const { withLock, withLockAsync } = await import('../lib/lock.mjs');
+const { importClaudeMem } = await import('../lib/claudemem.mjs');
+const { addImage, pullImages } = await import('../lib/drive.mjs');
+const { importMeetings } = await import('../lib/meetings.mjs');
+const { finalizeOutputs, pickImages } = await import('../lib/outputs.mjs');
+const { buildScreenshots } = await import('../lib/screenshots.mjs');
+const { planRenames, applyRenames, renameInState, brokenLinks } = await import('../lib/migrate.mjs');
 
 const SELF = fileURLToPath(import.meta.url);
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
@@ -380,18 +388,37 @@ const cmds = {
     const bin = path.join(home, '.local', 'bin', 'agent-wiki');
     if (!fs.existsSync(bin)) act('link ~/.local/bin/agent-wiki', () => { fs.mkdirSync(path.dirname(bin), { recursive: true }); fs.symlinkSync(SELF, bin); });
 
-    // Claude Code SessionEnd hook.
+    // Claude Code hooks: SessionEnd (capture) and UserPromptSubmit (point the agent at related past pages).
     const settings = path.join(home, '.claude', 'settings.json');
     if (fs.existsSync(settings)) {
       const s = JSON.parse(fs.readFileSync(settings, 'utf8'));
-      const cmd = `node "${SELF}" hook claude-session-end`;
-      const has = JSON.stringify(s.hooks?.SessionEnd || []).includes('agent-wiki');
-      if (!has) act('add Claude SessionEnd hook (backup: settings.json.bak-agent-wiki)', () => {
-        fs.copyFileSync(settings, settings + '.bak-agent-wiki');
-        s.hooks = s.hooks || {};
-        s.hooks.SessionEnd = [...(s.hooks.SessionEnd || []), { hooks: [{ type: 'command', command: cmd, timeout: 10 }] }];
-        fs.writeFileSync(settings, JSON.stringify(s, null, 2) + '\n');
-      });
+      const wanted = [
+        ['SessionEnd', `node "${SELF}" hook claude-session-end`, 10, 'Claude SessionEnd hook'],
+        ['UserPromptSubmit', `node "${SELF}" hook claude-prompt`, 5, 'Claude UserPromptSubmit hook (related past work)'],
+      ];
+      for (const [event, cmd, timeout, label] of wanted) {
+        if (JSON.stringify(s.hooks?.[event] || []).includes('agent-wiki')) continue;
+        act(`add ${label} (backup: settings.json.bak-agent-wiki)`, () => {
+          if (!fs.existsSync(settings + '.bak-agent-wiki')) fs.copyFileSync(settings, settings + '.bak-agent-wiki');
+          s.hooks = s.hooks || {};
+          s.hooks[event] = [...(s.hooks[event] || []), { hooks: [{ type: 'command', command: cmd, timeout }] }];
+          fs.writeFileSync(settings, JSON.stringify(s, null, 2) + '\n');
+        });
+      }
+    }
+
+    // Codex UserPromptSubmit hook: same JSON in and out as Claude's. Codex asks you to trust a new hook once (/hooks).
+    const codexHooks = path.join(home, '.codex', 'hooks.json');
+    if (fs.existsSync(codexHooks)) {
+      const h = JSON.parse(fs.readFileSync(codexHooks, 'utf8'));
+      if (!JSON.stringify(h.hooks?.UserPromptSubmit || []).includes('agent-wiki')) {
+        act('add Codex UserPromptSubmit hook (backup: hooks.json.bak-agent-wiki; Codex asks you to trust it once)', () => {
+          if (!fs.existsSync(codexHooks + '.bak-agent-wiki')) fs.copyFileSync(codexHooks, codexHooks + '.bak-agent-wiki');
+          h.hooks = h.hooks || {};
+          h.hooks.UserPromptSubmit = [...(h.hooks.UserPromptSubmit || []), { hooks: [{ type: 'command', command: `node "${SELF}" hook codex-prompt`, timeout: 5 }] }];
+          fs.writeFileSync(codexHooks, JSON.stringify(h, null, 2) + '\n');
+        });
+      }
     }
 
     // Global "read the wiki" instruction for Claude and Codex.
