@@ -12,7 +12,9 @@ A git-backed markdown wiki of what you did with coding agents — Claude Code, C
 - **Projects organize themselves:** pages are assigned to projects automatically, with one hub page
   per project (timeline, decisions, open items).
 - **Meetings:** daily import from Wispr Flow, linked to the sessions they relate to. Any machine with a
-  Wispr login can run it; a record in the vault makes the first one do the work and the others skip.
+  Wispr login can run it. A record per person in the vault makes the first machine of each person do the work and
+  that person's other machines skip; teammates never block each other, and a meeting two of them recorded is one page.
+  The person is the config key `wispr_user`, else the git email, else the OS user name.
 - **Links and screenshots, automatically:** artifact, Sheets/Docs, GitHub and `/mnt/` links are found in
   the raw record, and the newest screenshots go to Drive. No model needed.
 - **Agents read the wiki on their own:** a prompt hook shows related past pages (Claude Code and Codex).

@@ -119,25 +119,38 @@ Safety:
   45 s apart. The tool names come from that server's name: `mcp__` + name with every character that is not a letter, digit,
   `_` or `-` turned into `_` (`claude.ai Wispr Flow` → `mcp__claude_ai_Wispr_Flow__`, `wispr` → `mcp__wispr__`).
   Config key `wispr_tool_prefix` overrides it.
-- Shared run record: `.agent-wiki/meetings.json` in the vault, tracked in git:
+- Who is the user? Each person has their own Wispr login, so the run record is per person, not per vault. The name is needed
+  before the import (the record is checked first), so it cannot come from the import's own model call. Order: config key
+  `wispr_user`, else `git config --global user.email`, else the OS user name. It is slugged (lowercase, `a-z0-9-`) for file
+  names. `agent-wiki status` shows the name and where it came from.
+- Run record per user: `.agent-wiki/meetings/<user>.json` in the vault, tracked in git:
   `{last_run, machine, last_meeting_start}` (plus `claim_by`, `claim_at` while an import runs).
   Flow: pull; if `last_run` is under `meetings_min_hours` (default 20) old → skip ("already imported by <machine> at <time>");
   if another machine's claim is under 2 h old → skip; else commit + push our claim. A rejected push means another machine was
   faster: pull and check again. After the import: write `last_run`, `machine`, `last_meeting_start`, clear the claim, push.
   A failed import only clears the claim. `--force` ignores the hour rule (never a fresh claim of another machine);
-  `--dry-run` only reads the record.
+  `--dry-run` only reads the record. Two users never block each other (they write different files); two machines of the same
+  user do.
+- Old vaults have one record for everybody, `.agent-wiki/meetings.json`. The first user to run, who has no file yet, takes it
+  over: its content moves to that user's file and the old file is removed (`git rm`), in the same commit as the claim (also
+  when the answer is "skip", so the next user does not inherit it). If it holds a fresh claim (an import in the old format is
+  running), nothing moves and the user skips. The old file is never removed in any other case.
 - Pull meetings that started after `last_meeting_start` minus one day (a late-edited meeting is re-read). The point comes from
-  the vault record, so every machine reads from the same place; a vault with no record yet falls back to this machine's state.
+  the user's record, so every machine of that user reads from the same place; a user with no record yet falls back to this
+  machine's state.
   A run with unreadable meetings, `--limit` or `--since` does not move it.
-- Dedupe by `wispr_id`; the same meeting from two teammates = one page.
+- Dedupe by `wispr_id`; the same meeting from two teammates = one page. The page lists who recorded it in frontmatter
+  `recorded_by: [<user>, …]`. When a second person imports a meeting that already has a page, she is added to that list and
+  the page is not rewritten. The same person reading a meeting again (a late edit) rewrites it, keeping the list. A page from
+  an older version has no list: it is rewritten once and gets one.
 - Page: date, attendees, summary, decisions, action items, link to Wispr.
 - Linking both ways: sure (session opened/named the meeting) or likely (same project+topic within
   ~7 days). Action item done in a session → marked done with a link.
 - Wispr is a claude.ai connector; a headless run can start before it is connected ("still
   connecting"). The list call is retried 3 times, 45 s apart; then the import fails with a clear
   reason kept in state, and `agent-wiki status` shows "meetings: last import failed <time>: <reason>".
-- `agent-wiki status` also shows the last import and its machine (read from the vault record, no pull) and whether this
-  machine has a Wispr login (`claude mcp list`, about 10 s).
+- `agent-wiki status` also shows which user this machine imports as, the last import of that user and its machine (read from
+  the vault record, no pull) and whether this machine has a Wispr login (`claude mcp list`, about 10 s).
 
 ## Reading the wiki (automatic)
 `agent-wiki hook claude-prompt` / `codex-prompt` run on every prompt (UserPromptSubmit; same JSON in

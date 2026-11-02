@@ -1,7 +1,7 @@
 import './setup.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseMcpList, pickWispr, toolPrefix, normalizePrefix, wisprTools, wisprLogin } from '../lib/wispr.mjs';
+import { parseMcpList, pickWispr, toolPrefix, normalizePrefix, wisprTools, wisprLogin, wisprUser, userSlug } from '../lib/wispr.mjs';
 import { MCP } from './fakes.mjs';
 
 const list = (...lines) => ({ stdout: `Checking MCP server health…\n\n${lines.join('\n')}\n${MCP.other}\n` });
@@ -92,4 +92,23 @@ test('a server that never connects: no login after the last check', () => {
   assert.equal(r.state, 'none');
   assert.equal(calls, 4);
   assert.match(r.reason, /Failed to connect/);
+});
+
+test('userSlug: lowercase letters, digits and "-" only', () => {
+  assert.equal(userSlug('Ann Lee'), 'ann-lee');
+  assert.equal(userSlug('ann.lee@example.com'), 'ann-lee-example-com');
+  assert.equal(userSlug('  --Ünï/../x--  '), 'n-x');
+  assert.equal(userSlug('///'), '');
+  assert.equal(userSlug(undefined), '');
+  assert.ok(userSlug('a'.repeat(200)).length <= 60);
+});
+
+test('wisprUser: config wispr_user wins, then git user.email, then the OS user name', () => {
+  const git = () => 'Ann@Example.com\n';
+  const osUser = () => 'annos';
+  assert.deepEqual(wisprUser({ wispr_user: 'Ann L' }, { git, osUser }), { slug: 'ann-l', source: 'config wispr_user', raw: 'Ann L' });
+  assert.deepEqual(wisprUser({}, { git, osUser }), { slug: 'ann-example-com', source: 'git config --global user.email', raw: 'Ann@Example.com' });
+  assert.equal(wisprUser({ wispr_user: '   ' }, { git, osUser }).source, 'git config --global user.email', 'a blank config value is not a name');
+  assert.deepEqual(wisprUser({}, { git: () => '', osUser }), { slug: 'annos', source: 'OS user name', raw: 'annos' });
+  assert.equal(wisprUser({}, { git: () => '///', osUser: () => '' }).slug, 'unknown-user', 'never an empty file name');
 });
