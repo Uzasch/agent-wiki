@@ -293,8 +293,13 @@ const cmds = {
       const since = typeof sinceFlag === 'string' ? new Date(sinceFlag).toISOString() : loadState().meetings?.last_run;
       if (!fs.existsSync(dir)) initVault(dir);
       const res = importMeetings(dir, { since, limit, dryRun: dry, model: cfg.fallback_model, log });
-      if (res.error) { log(`meetings ${res.error}`); return res; }
+      if (res.error) {
+        log(`meetings ${res.error}`);
+        if (!dry) updateState('meetings', { failed_at: new Date().toISOString(), failed_reason: String(res.error).slice(0, 400) });
+        return res;
+      }
       if (!dry) {
+        updateState('meetings', { failed_at: null, failed_reason: null });
         if (res.pages.length) res.organize = organizeSafe(name);
         res.sync = res.pages.length ? syncVault(dir, `meetings: ${res.pages.length} imported`) : { ok: true, note: 'nothing new' };
         // Overlap by a day: a late-edited meeting is re-read, and dedupe by wispr_id keeps one page.
@@ -466,7 +471,11 @@ const cmds = {
       const ahead = spawnSync('git', ['-C', dir, 'rev-list', '--count', '@{u}..HEAD'], { encoding: 'utf8' });
       console.log(`vault ${n}: ${dir} ${ahead.status === 0 ? `(${ahead.stdout.trim()} commits not pushed)` : ''}`);
     }
-    const errors = Object.entries(loadState()).filter(([, v]) => v.error);
+    const st = loadState();
+    const m = st.meetings;
+    if (m?.failed_at) console.log(`meetings: last import failed ${m.failed_at}: ${m.failed_reason}`);
+    else if (m?.last_run) console.log(`meetings: last import ok (read from ${m.last_run})`);
+    const errors = Object.entries(st).filter(([, v]) => v.error);
     for (const [k, v] of errors) console.log(`error ${k}: ${v.error}`);
   },
 };
