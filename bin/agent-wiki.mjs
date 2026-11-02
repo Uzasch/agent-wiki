@@ -14,6 +14,7 @@ import { importClaudeMem } from '../lib/claudemem.mjs';
 import { addImage, pullImages } from '../lib/drive.mjs';
 import { importMeetings } from '../lib/meetings.mjs';
 import { finalizeOutputs } from '../lib/outputs.mjs';
+import { planRenames, applyRenames, renameInState, brokenLinks } from '../lib/migrate.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
@@ -306,6 +307,35 @@ const cmds = {
     if (bad) process.exit(1);
   },
 
+  // Give old session pages a short title in the file name and fix every link to them.
+  // `migrate-names [--vault <name>] [--dry-run]`
+  'migrate-names'(args) {
+    const dry = !!flag(args, '--dry-run');
+    const vname = flag(args, '--vault');
+    const cfg = loadConfig();
+    const names = typeof vname === 'string' ? [vname] : Object.keys(cfg.vaults);
+    let bad = false;
+    for (const n of names) {
+      const dir = vaultPath(cfg, n);
+      if (!dir || !fs.existsSync(dir)) { console.error(`unknown vault "${n}"`); bad = true; continue; }
+      const plan = planRenames(dir);
+      console.log(`${n}: ${plan.length} session page(s) to rename${dry ? ' (dry run)' : ''}`);
+      for (const { from, to } of plan) console.log(`  ${from} -> ${to}`);
+      if (dry || !plan.length) continue;
+      const before = brokenLinks(dir).length;
+      const r = applyRenames(dir, plan);
+      const st = loadState();
+      renameInState(st, plan);
+      saveState(st);
+      const after = brokenLinks(dir).length;
+      console.log(`${n}: renamed ${r.renamed}, rewrote ${r.links} link(s) in ${r.files} file(s); broken links before ${before}, after ${after}`);
+      if (after > before) { console.error(`${n}: renaming left ${after - before} new broken link(s)`); bad = true; }
+      const sync = syncVault(dir, `rename ${r.renamed} session page(s) to short names`);
+      if (!sync.ok) { console.error(`${n}: sync failed: ${sync.error}`); bad = true; }
+    }
+    if (bad) process.exit(1);
+  },
+
   // Wire this machine: personal vault, skills, Claude hook, sweep timer, global read-instruction.
   install(args) {
     const dry = !!flag(args, '--dry-run');
@@ -407,7 +437,7 @@ const cmds = {
 
 const [cmd, ...args] = process.argv.slice(2);
 if (!cmds[cmd]) {
-  console.log('usage: agent-wiki <set|vault|image|drive|meetings|organize|import-claude-mem|capture|hook|sweep|sync|status> …');
+  console.log('usage: agent-wiki <set|vault|image|drive|meetings|organize|migrate-names|import-claude-mem|capture|hook|sweep|sync|status> …');
   process.exit(cmd ? 1 : 0);
 }
 await cmds[cmd](args);

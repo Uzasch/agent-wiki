@@ -73,6 +73,8 @@ with `agent-wiki drive pull <vault>`.
 
 ## Rules
 
+- Session pages are named `sessions/YYYY-MM-DD-<short-title>-<id8>.md`. Never rename one by hand:
+  `agent-wiki migrate-names` renames old pages and fixes every link to them.
 - Never write secrets (keys, tokens, passwords) into the wiki.
 - Links are markdown links `[text](../path.md)`, not `[[wikilinks]]`.
 - Large media: link the NAS path or Drive link, never copy the file in.
