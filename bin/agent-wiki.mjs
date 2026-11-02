@@ -7,13 +7,14 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, saveConfig, resolveVault, rememberFolder, vaultPath, STATE_DIR, expand } from '../lib/config.mjs';
 import { readSession, findSession, listClaudeFiles, listCodexFiles, listAgyFiles, fileMtime, eventsAfter, userTurns, lastEvent, transcriptText } from '../lib/sessions.mjs';
 import { summarise } from '../lib/summarise.mjs';
-import { initVault, writeSessionPage, syncVault } from '../lib/vault.mjs';
+import { initVault, writeSessionPage, findSessionPage, syncVault } from '../lib/vault.mjs';
 import { listProjects, createProjectPage, organizeVault } from '../lib/projects.mjs';
-import { withLock } from '../lib/lock.mjs';
+import { withLock, withLockAsync } from '../lib/lock.mjs';
 import { importClaudeMem } from '../lib/claudemem.mjs';
 import { addImage, pullImages } from '../lib/drive.mjs';
 import { importMeetings } from '../lib/meetings.mjs';
-import { finalizeOutputs } from '../lib/outputs.mjs';
+import { finalizeOutputs, pickImages } from '../lib/outputs.mjs';
+import { buildScreenshots } from '../lib/screenshots.mjs';
 import { planRenames, applyRenames, renameInState, brokenLinks } from '../lib/migrate.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -47,7 +48,7 @@ function flag(args, name) {
 }
 
 // ---------- capture one session ----------
-function capture(s, { force = false, fresh = false } = {}) {
+async function capture(s, { force = false, fresh = false } = {}) {
   const cfg = loadConfig();
   const key = `${s.tool}:${s.id}`;
   if (s.headless && !cfg.include_headless) return { skip: 'headless' };
@@ -67,7 +68,7 @@ function capture(s, { force = false, fresh = false } = {}) {
   const mode = cfg.capture_mode;
   const useFork = !fresh && s.tool !== 'agy' && !coldCache && (mode === 'fork-warm' || (mode === 'fork-long' && long));
   let projects = [];
-  const res = withLock(`session-${key}`, () => {
+  const res = await withLockAsync(`session-${key}`, async () => {
     if (fs.existsSync(dir)) projects = listProjects(dir);
     const sum = summarise(s, s.events, { since: prev?.at, fallbackModel: cfg.fallback_model, preferFresh: !useFork, projects, allowSkip: userTurns(s) < 5 });
     if (sum.error) return { error: sum.error };
@@ -75,13 +76,21 @@ function capture(s, { force = false, fresh = false } = {}) {
     if (sum.skip) { updateState(key, { anchor, at: new Date().toISOString(), skipped: true }); return { skip: 'model said SKIP' }; }
     if (!fs.existsSync(dir)) initVault(dir);
     if (sum.newProject) createProjectPage(dir, sum.newProject);
-    // Deterministic outputs: links and NAS paths found in the raw record.
+    // Deterministic outputs: links and NAS paths found in the raw record; screenshots go to Drive when the vault has one.
     const outputs = s.harvest ? finalizeOutputs(s.harvest) : [];
-    const page = writeSessionPage(dir, s, sum, { machine: cfg.machine, vaultName, outputs });
+    let screenshots = '';
+    if (s.harvest && cfg.vaults[vaultName]?.drive) {
+      try {
+        const old = findSessionPage(dir, s);
+        screenshots = await buildScreenshots({ images: pickImages(s.harvest), vault: cfg.vaults[vaultName], vaultName, vaultDir: dir,
+          session: s, existing: old ? fs.readFileSync(path.join(dir, old), 'utf8') : '', log });
+      } catch (e) { log(`screenshots failed for ${key}: ${String(e.message || e).slice(0, 200)}`); }
+    }
+    const page = writeSessionPage(dir, s, sum, { machine: cfg.machine, vaultName, outputs, screenshots });
     const sync = syncVault(dir, `session: ${sum.title}`.slice(0, 120));
     updateState(key, { anchor, at: new Date().toISOString(), vault: vaultName, page, skipped: false,
       error: sync.ok ? null : sync.error });
-    return { page, vault: vaultName, how: sum.how, cost: sum.cost, cached: sum.cached, sync, outputs: outputs.length };
+    return { page, vault: vaultName, how: sum.how, cost: sum.cost, cached: sum.cached, sync, outputs: outputs.length, screenshots: (screenshots.match(/!\[/g) || []).length };
   });
   return res.locked ? { skip: 'already capturing' } : res.value;
 }
@@ -182,13 +191,13 @@ const cmds = {
     } catch (e) { console.error(`drive pull failed: ${e.message}`); process.exit(1); }
   },
 
-  capture(args) {
+  async capture(args) {
     const tool = flag(args, '--tool') || 'claude';
     const id = flag(args, '--id');
     const file = flag(args, '--file');
     const s = file ? readSession(tool, file) : findSession(tool, id);
     if (!s) { console.error('session not found'); process.exit(1); }
-    const r = capture(s, { force: !!flag(args, '--force'), fresh: !!flag(args, '--fresh') });
+    const r = await capture(s, { force: !!flag(args, '--force'), fresh: !!flag(args, '--fresh') });
     log(`capture ${tool}:${s.id} ${JSON.stringify(r)}`);
     console.log(JSON.stringify(r, null, 1));
   },
@@ -207,10 +216,10 @@ const cmds = {
   },
 
   // Every few minutes: capture sessions idle past the limit with new work (covers sleep, Codex, crashes).
-  sweep(args) {
+  async sweep(args) {
     const dry = !!flag(args, '--dry-run');
     const max = Number(flag(args, '--max') || 5);
-    const r = withLock('sweep', () => {
+    const r = await withLockAsync('sweep', async () => {
       const cfg = loadConfig();
       const since = Math.max(installedAt(), Date.now() - 7 * 86400_000);
       const idleMs = cfg.idle_minutes * 60_000;
@@ -235,7 +244,7 @@ const cmds = {
       const lines = [];
       const vaults = new Set();
       for (const s of due.slice(0, max)) {
-        const res = capture(s);
+        const res = await capture(s);
         log(`sweep ${s.tool}:${s.id} ${JSON.stringify(res)}`);
         if (res.page) vaults.add(res.vault);
         lines.push(`${s.tool}:${s.id} ${JSON.stringify(res)}`);
