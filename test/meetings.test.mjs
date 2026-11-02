@@ -52,6 +52,12 @@ test('another error is not retried', () => {
   assert.match(r.error, /^list failed: bad json/);
 });
 
+test('the style rule reaches the meeting writer prompt', () => {
+  const { ask, calls } = fake([{ json: [{ id: 'm1', title: 'Sync', start: '2026-03-01T10:00:00Z' }] }, { json: detail }]);
+  fetchMeetings({ ask, sleep: () => {}, style: 'STYLE-RULE-MARKER' });
+  assert.match(calls[1], /STYLE-RULE-MARKER/);
+});
+
 test('status shows a failed import with its time and reason', () => {
   const home = path.join(SCRATCH, 'status-home');
   fs.mkdirSync(path.join(home, 'state'), { recursive: true });

@@ -15,7 +15,7 @@ const { fileURLToPath } = await import('node:url');
 const { loadConfig, saveConfig, resolveVault, rememberFolder, vaultPath, STATE_DIR, expand } = await import('../lib/config.mjs');
 const { readSession, findSession, listClaudeFiles, listCodexFiles, listAgyFiles, fileMtime, eventsAfter, userTurns, lastEvent, transcriptText } = await import('../lib/sessions.mjs');
 const { summarise } = await import('../lib/summarise.mjs');
-const { initVault, writeSessionPage, findSessionPage, syncVault } = await import('../lib/vault.mjs');
+const { initVault, writeSessionPage, findSessionPage, syncVault, readFrontmatter } = await import('../lib/vault.mjs');
 const { listProjects, createProjectPage, organizeVault } = await import('../lib/projects.mjs');
 const { withLock, withLockAsync } = await import('../lib/lock.mjs');
 const { importClaudeMem } = await import('../lib/claudemem.mjs');
@@ -23,6 +23,7 @@ const { addImage, pullImages } = await import('../lib/drive.mjs');
 const { importMeetings } = await import('../lib/meetings.mjs');
 const { finalizeOutputs, pickImages } = await import('../lib/outputs.mjs');
 const { buildScreenshots } = await import('../lib/screenshots.mjs');
+const { glossaryFor, glossaryForFolders, styleBlock } = await import('../lib/glossary.mjs');
 const { planRenames, applyRenames, renameInState, brokenLinks } = await import('../lib/migrate.mjs');
 
 const SELF = fileURLToPath(import.meta.url);
@@ -78,7 +79,8 @@ async function capture(s, { force = false, fresh = false } = {}) {
   let projects = [];
   const res = await withLockAsync(`session-${key}`, async () => {
     if (fs.existsSync(dir)) projects = listProjects(dir);
-    const sum = summarise(s, s.events, { since: prev?.at, fallbackModel: cfg.fallback_model, preferFresh: !useFork, projects, allowSkip: userTurns(s) < 5 });
+    const style = styleBlock(glossaryFor(s.cwd, transcriptText(s.events)));
+    const sum = summarise(s, s.events, { since: prev?.at, fallbackModel: cfg.fallback_model, preferFresh: !useFork, projects, allowSkip: userTurns(s) < 5, style });
     if (sum.error) return { error: sum.error };
     const anchor = lastEvent(s)?.id;
     if (sum.skip) { updateState(key, { anchor, at: new Date().toISOString(), skipped: true }); return { skip: 'model said SKIP' }; }
@@ -101,6 +103,20 @@ async function capture(s, { force = false, fresh = false } = {}) {
     return { page, vault: vaultName, how: sum.how, cost: sum.cost, cached: sum.cached, sync, outputs: outputs.length, screenshots: (screenshots.match(/!\[/g) || []).length };
   });
   return res.locked ? { skip: 'already capturing' } : res.value;
+}
+
+// Style rule for the meeting writer: the glossary of the folders mapped to this vault, picked by what the
+// vault's recent pages talk about (a meeting is read inside the model call, so its own text is not known yet).
+function vaultStyle(cfg, name, dir) {
+  try {
+    const folders = Object.entries(cfg.folders).filter(([, v]) => v === name).map(([f]) => expand(f)).filter((f) => fs.existsSync(f));
+    const text = [...listProjects(dir).map((p) => `${p.title} ${p.description}`),
+      ...fs.readdirSync(path.join(dir, 'sessions')).sort().slice(-60).map((f) => {
+        const fm = readFrontmatter(path.join(dir, 'sessions', f));
+        return `${fm.title || ''} ${fm.description || ''}`;
+      })].join('\n');
+    return styleBlock(glossaryForFolders(folders, text, { cap: 6000 }));
+  } catch { return styleBlock(''); }
 }
 
 // Organize one vault, never throw. Logs the result.
@@ -292,7 +308,7 @@ const cmds = {
       const started = new Date().toISOString();
       const since = typeof sinceFlag === 'string' ? new Date(sinceFlag).toISOString() : loadState().meetings?.last_run;
       if (!fs.existsSync(dir)) initVault(dir);
-      const res = importMeetings(dir, { since, limit, dryRun: dry, model: cfg.fallback_model, log });
+      const res = importMeetings(dir, { since, limit, dryRun: dry, model: cfg.fallback_model, log, style: vaultStyle(cfg, name, dir) });
       if (res.error) {
         log(`meetings ${res.error}`);
         if (!dry) updateState('meetings', { failed_at: new Date().toISOString(), failed_reason: String(res.error).slice(0, 400) });
@@ -356,6 +372,16 @@ const cmds = {
       if (!sync.ok) { console.error(`${n}: sync failed: ${sync.error}`); bad = true; }
     }
     if (bad) process.exit(1);
+  },
+
+  // Project glossary entries that match a text (for writers that do not go through capture, e.g. a saved discussion).
+  // `glossary [--cwd DIR] [--file F]` (text from the file, or stdin)
+  glossary(args) {
+    const cwd = flag(args, '--cwd');
+    const file = flag(args, '--file');
+    const text = typeof file === 'string' ? fs.readFileSync(file, 'utf8') : process.stdin.isTTY ? '' : fs.readFileSync(0, 'utf8');   // no --file: read stdin
+    const block = glossaryFor(typeof cwd === 'string' ? cwd : process.cwd(), text);
+    console.log(block || '(no glossary found, or no term from it appears in the text)');
   },
 
   // Wire this machine: personal vault, skills, Claude hook, sweep timer, global read-instruction.
@@ -482,7 +508,7 @@ const cmds = {
 
 const [cmd, ...args] = process.argv.slice(2);
 if (!cmds[cmd]) {
-  console.log('usage: agent-wiki <set|vault|image|drive|meetings|organize|migrate-names|import-claude-mem|capture|hook|sweep|sync|status> …');
+  console.log('usage: agent-wiki <set|vault|image|drive|meetings|organize|migrate-names|glossary|import-claude-mem|capture|hook|sweep|sync|status> …');
   process.exit(cmd ? 1 : 0);
 }
 await cmds[cmd](args);

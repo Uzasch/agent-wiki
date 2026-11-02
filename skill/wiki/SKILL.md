@@ -28,6 +28,19 @@ New vault: `agent-wiki vault new <name> <owner/repo>` (clones the repo to `~/wik
 A hook may already have put "agent-wiki: related past work" lines in your context: those are pages
 that match the user's prompt. Open the ones that fit before you start; ignore the ones that do not.
 
+## Writing style (every page you write)
+
+The reader is not an engineer and does not know this session. So:
+
+1. Start with ONE line of context: what this is and why it matters, in plain words.
+2. Then write in ASD-STE100 Simplified Technical English: short sentences (about 20 words at most),
+   one idea per sentence, active voice, simple common words, no jargon. If a technical word is
+   needed, say what it means in a few words.
+3. Use the project's domain words from its `GLOSSARY.md` (a repo with several contexts has a
+   `GLOSSARY-MAP.md` that points to the right one). Never use the words under `_Avoid_`.
+   `agent-wiki glossary --cwd <project folder> --file <draft.md>` prints only the glossary entries
+   that appear in the draft.
+
 ## Save a discussion / meeting points
 
 When the user asks to save a discussion or types meeting points, write
@@ -60,12 +73,12 @@ title and description are in its frontmatter). Set `project:` to the slug of the
 belongs to. If none fits, leave `project:` empty: `agent-wiki organize` assigns it (and creates a
 new project when needed). Never ask the user which project; never invent a slug.
 
-Then run `agent-wiki sync <vault>` (or `agent-wiki organize --vault <vault>` to assign the project now).
+Write the page in the style above. Then run `agent-wiki sync <vault>` (or `agent-wiki organize --vault <vault>` to assign the project now).
 
 ## Continue a discussion
 
 Read the page, do the work, then add a new `## <date> — <who>` section at the bottom (never
-rewrite earlier sections), update `status` and `updated`, and run `agent-wiki sync <vault>`.
+rewrite earlier sections; write it in the style above), update `status` and `updated`, and run `agent-wiki sync <vault>`.
 
 ## Images and screenshots
 
