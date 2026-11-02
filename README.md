@@ -11,7 +11,8 @@ A git-backed markdown wiki of what you did with coding agents — Claude Code, C
   folder → vault map.
 - **Projects organize themselves:** pages are assigned to projects automatically, with one hub page
   per project (timeline, decisions, open items).
-- **Meetings:** daily import from Wispr Flow, linked to the sessions they relate to.
+- **Meetings:** daily import from Wispr Flow, linked to the sessions they relate to. Any machine with a
+  Wispr login can run it; a record in the vault makes the first one do the work and the others skip.
 - **Links and screenshots, automatically:** artifact, Sheets/Docs, GitHub and `/mnt/` links are found in
   the raw record, and the newest screenshots go to Drive. No model needed.
 - **Agents read the wiki on their own:** a prompt hook shows related past pages (Claude Code and Codex).

@@ -110,7 +110,25 @@ Safety:
 - One writer per file (`log/<machine>/`, session pages per host+session).
 
 ## Meetings (Wispr Flow)
-- Daily job, one machine per person. Pull meetings since last run; all meetings (operator choice).
+- Daily job on every machine that has a Wispr login; the first one to run does the work, the others skip.
+  Timer: 08:00 plus `RandomizedDelaySec=30min` (`agent-wiki install` also rewrites an older timer without it).
+- Login check first: `claude mcp list` (60 s limit) must show a connected server whose URL contains
+  `wisprflow.ai/connect/mcp` — the claude.ai connector (`claude.ai Wispr Flow`) or one added by hand (e.g. `wispr`).
+  None, or "Needs authentication" → log "meetings: no Wispr login on this machine, skipped", exit 0. If several are
+  connected, a direct server wins over the connector. A server that is listed but still connecting is re-checked 3 times,
+  45 s apart. The tool names come from that server's name: `mcp__` + name with every character that is not a letter, digit,
+  `_` or `-` turned into `_` (`claude.ai Wispr Flow` → `mcp__claude_ai_Wispr_Flow__`, `wispr` → `mcp__wispr__`).
+  Config key `wispr_tool_prefix` overrides it.
+- Shared run record: `.agent-wiki/meetings.json` in the vault, tracked in git:
+  `{last_run, machine, last_meeting_start}` (plus `claim_by`, `claim_at` while an import runs).
+  Flow: pull; if `last_run` is under `meetings_min_hours` (default 20) old → skip ("already imported by <machine> at <time>");
+  if another machine's claim is under 2 h old → skip; else commit + push our claim. A rejected push means another machine was
+  faster: pull and check again. After the import: write `last_run`, `machine`, `last_meeting_start`, clear the claim, push.
+  A failed import only clears the claim. `--force` ignores the hour rule (never a fresh claim of another machine);
+  `--dry-run` only reads the record.
+- Pull meetings that started after `last_meeting_start` minus one day (a late-edited meeting is re-read). The point comes from
+  the vault record, so every machine reads from the same place; a vault with no record yet falls back to this machine's state.
+  A run with unreadable meetings, `--limit` or `--since` does not move it.
 - Dedupe by `wispr_id`; the same meeting from two teammates = one page.
 - Page: date, attendees, summary, decisions, action items, link to Wispr.
 - Linking both ways: sure (session opened/named the meeting) or likely (same project+topic within
@@ -118,6 +136,8 @@ Safety:
 - Wispr is a claude.ai connector; a headless run can start before it is connected ("still
   connecting"). The list call is retried 3 times, 45 s apart; then the import fails with a clear
   reason kept in state, and `agent-wiki status` shows "meetings: last import failed <time>: <reason>".
+- `agent-wiki status` also shows the last import and its machine (read from the vault record, no pull) and whether this
+  machine has a Wispr login (`claude mcp list`, about 10 s).
 
 ## Reading the wiki (automatic)
 `agent-wiki hook claude-prompt` / `codex-prompt` run on every prompt (UserPromptSubmit; same JSON in
@@ -139,7 +159,7 @@ owner, status). "continue discussion X" → read it, work, append a dated sectio
 ## Packaging
 - npm package `agent-wiki`, CLI `agent-wiki` (core, agent-agnostic).
 - `npx agent-wiki install` — detects agents, wires adapters, writes config, clones vaults,
-  installs a user systemd timer (sweep + meetings). Re-runnable.
+  installs a user systemd timer (sweep + meetings). Re-runnable; it updates an older meetings timer.
 - One `wiki` skill (Agent Skills format) for all agents: `set-wiki`, save/continue discussion,
   lookup.
 - Adapters: Claude Code (marketplace plugin: skill + hooks), Codex (`hooks.json` + skill), opencode

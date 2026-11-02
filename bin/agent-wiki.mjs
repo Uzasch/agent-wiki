@@ -21,6 +21,8 @@ const { withLock, withLockAsync } = await import('../lib/lock.mjs');
 const { importClaudeMem } = await import('../lib/claudemem.mjs');
 const { addImage, pullImages } = await import('../lib/drive.mjs');
 const { importMeetings } = await import('../lib/meetings.mjs');
+const { wisprLogin, wisprTools } = await import('../lib/wispr.mjs');
+const { claimRun, finishRun, readRun, sinceFromRun } = await import('../lib/meetingrun.mjs');
 const { finalizeOutputs, pickImages } = await import('../lib/outputs.mjs');
 const { buildScreenshots } = await import('../lib/screenshots.mjs');
 const { glossaryFor, glossaryForFolders, styleBlock } = await import('../lib/glossary.mjs');
@@ -294,37 +296,70 @@ const cmds = {
     if (!r.ok) process.exit(1);
   },
 
-  // Wispr Flow meetings → vault pages (daily timer). `meetings import [--vault N] [--since ISO] [--dry-run] [--limit N]`
+  // Wispr Flow meetings → vault pages (daily timer, any machine with a Wispr login).
+  // `meetings import [--vault N] [--since ISO] [--dry-run] [--limit N] [--force]`
+  // Skips (exit 0) when this machine has no Wispr login, or another machine imported in the last `meetings_min_hours`
+  // (default 20) hours — the shared record is .agent-wiki/meetings.json in the vault. --force ignores that hour rule.
   meetings(args) {
-    if (args.shift() !== 'import') { console.error('usage: agent-wiki meetings import [--vault <name>] [--since <ISO>] [--dry-run] [--limit N]'); process.exit(1); }
+    if (args.shift() !== 'import') { console.error('usage: agent-wiki meetings import [--vault <name>] [--since <ISO>] [--dry-run] [--limit N] [--force]'); process.exit(1); }
     const dry = !!flag(args, '--dry-run');
+    const force = !!flag(args, '--force');
     const cfg = loadConfig();
     const name = flag(args, '--vault') || cfg.meetings_vault || 'work';
     const sinceFlag = flag(args, '--since');
     const limit = Number(flag(args, '--limit')) || undefined;
     const dir = vaultPath(cfg, name);
     if (!dir) { console.error(`unknown vault "${name}" — add it with: agent-wiki vault new ${name} <owner/repo>`); process.exit(1); }
+    const done = (msg) => { log(msg); console.log(msg); };
+
+    // 1. Is this machine logged in to Wispr? No login is normal on most machines: skip, not an error.
+    const login = wisprLogin({ prefix: cfg.wispr_tool_prefix, onWait: log });
+    if (login.state === 'none') { log(`meetings: no Wispr login: ${login.reason}`); done('meetings: no Wispr login on this machine, skipped'); return; }
+    if (login.state === 'error') {
+      log(`meetings: could not check the Wispr login: ${login.error}`);
+      if (!dry) updateState('meetings', { failed_at: new Date().toISOString(), failed_reason: String(login.error).slice(0, 400) });
+      console.error(`meetings: could not check the Wispr login: ${login.error}`);
+      process.exit(1);
+    }
+
     const r = withLock('meetings', () => {
-      const started = new Date().toISOString();
-      const since = typeof sinceFlag === 'string' ? new Date(sinceFlag).toISOString() : loadState().meetings?.last_run;
       if (!fs.existsSync(dir)) initVault(dir);
-      const res = importMeetings(dir, { since, limit, dryRun: dry, model: cfg.fallback_model, log, style: vaultStyle(cfg, name, dir) });
+      // 2. One machine per day: claim the run in the vault (pull, check, push). A dry run only reads.
+      let record = readRun(dir);
+      if (!dry) {
+        const claim = claimRun(dir, { machine: cfg.machine, minHours: Number(cfg.meetings_min_hours ?? 20), force });
+        if (claim.skip) return { skipped: claim.skip };
+        if (!claim.ok) return { error: claim.error };
+        record = claim.record;
+      }
+      const release = () => (dry ? undefined : finishRun(dir, { machine: cfg.machine, update: false }));
+      // All machines read from the same place: the newest meeting of the last import (local state only for a vault with no record yet).
+      const since = typeof sinceFlag === 'string' ? new Date(sinceFlag).toISOString() : sinceFromRun(record) || loadState().meetings?.last_run;
+      let res;
+      try {
+        res = importMeetings(dir, { since, limit, dryRun: dry, model: cfg.fallback_model, log, style: vaultStyle(cfg, name, dir), tools: wisprTools(login.prefix) });
+      } catch (e) { release(); throw e; }
       if (res.error) {
         log(`meetings ${res.error}`);
         if (!dry) updateState('meetings', { failed_at: new Date().toISOString(), failed_reason: String(res.error).slice(0, 400) });
+        release();
         return res;
       }
       if (!dry) {
         updateState('meetings', { failed_at: null, failed_reason: null });
         if (res.pages.length) res.organize = organizeSafe(name);
         res.sync = res.pages.length ? syncVault(dir, `meetings: ${res.pages.length} imported`) : { ok: true, note: 'nothing new' };
-        // Overlap by a day: a late-edited meeting is re-read, and dedupe by wispr_id keeps one page.
-        if (!limit && !sinceFlag && !res.errors.length) updateState('meetings', { last_run: new Date(Date.parse(started) - 86400_000).toISOString() });
+        // A partial run (--limit, --since) must not move the shared reading point. A clean run moves it to the newest meeting;
+        // a run with unreadable meetings still counts as the day's import but keeps the old reading point, so they are tried again.
+        const partial = !!limit || typeof sinceFlag === 'string';
+        res.record = finishRun(dir, { machine: cfg.machine, update: !partial, lastMeetingStart: res.errors.length ? null : res.newest });
+        if (!res.record.ok) res.errors.push(`run record: ${res.record.error}`);
       }
-      log(`meetings ${JSON.stringify({ since, n: res.pages.length, cost: res.cost, errors: res.errors })}`);
+      log(`meetings ${JSON.stringify({ since, n: res.pages.length, cost: res.cost, errors: res.errors, login: login.name })}`);
       return res;
     }, { staleMs: 60 * 60_000 });
-    if (r.locked) { console.log('meetings import already running'); return; }
+    if (r.locked) { done('meetings import already running'); return; }
+    if (r.value.skipped) { done(`meetings: ${r.value.skipped}${r.value.skipped.startsWith('already') ? ' (use --force to run anyway)' : ''}`); return; }
     console.log(JSON.stringify(r.value, null, 1));
     if (r.value.error || r.value.sync?.ok === false) process.exit(1);
   },
@@ -474,16 +509,22 @@ const cmds = {
         spawnSync('systemctl', ['--user', 'enable', '--now', 'agent-wiki-sweep.timer']);
       });
     }
-    // Meetings import daily at 08:00 local.
-    if (!fs.existsSync(path.join(unitDir, 'agent-wiki-meetings.timer'))) {
-      act('install systemd user timer agent-wiki-meetings (daily 08:00)', () => {
+    // Meetings import daily at 08:00 local, plus up to 30 min of random delay: every machine with a Wispr login runs it,
+    // the shared record in the vault lets the first one do the work and the others skip. An older timer without the delay is rewritten.
+    const meetingsTimer = path.join(unitDir, 'agent-wiki-meetings.timer');
+    const timerHasDelay = fs.existsSync(meetingsTimer) && /^RandomizedDelaySec=/m.test(fs.readFileSync(meetingsTimer, 'utf8'));
+    if (!timerHasDelay) {
+      const update = fs.existsSync(meetingsTimer);
+      act(update ? 'update systemd user timer agent-wiki-meetings (add RandomizedDelaySec=30min)' : 'install systemd user timer agent-wiki-meetings (daily 08:00, up to 30 min later)', () => {
         fs.mkdirSync(unitDir, { recursive: true });
-        fs.writeFileSync(path.join(unitDir, 'agent-wiki-meetings.service'),
-          `[Unit]\nDescription=agent-wiki Wispr meetings import\n\n[Service]\nType=oneshot\nEnvironment=PATH=${process.env.PATH}\nExecStart=${process.execPath} ${SELF} meetings import\nNice=10\n`);
-        fs.writeFileSync(path.join(unitDir, 'agent-wiki-meetings.timer'),
-          '[Unit]\nDescription=agent-wiki meetings import daily\n\n[Timer]\nOnCalendar=*-*-* 08:00:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n');
+        if (!update) {
+          fs.writeFileSync(path.join(unitDir, 'agent-wiki-meetings.service'),
+            `[Unit]\nDescription=agent-wiki Wispr meetings import\n\n[Service]\nType=oneshot\nEnvironment=PATH=${process.env.PATH}\nExecStart=${process.execPath} ${SELF} meetings import\nNice=10\n`);
+        }
+        fs.writeFileSync(meetingsTimer,
+          '[Unit]\nDescription=agent-wiki meetings import daily\n\n[Timer]\nOnCalendar=*-*-* 08:00:00\nRandomizedDelaySec=30min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n');
         spawnSync('systemctl', ['--user', 'daemon-reload']);
-        spawnSync('systemctl', ['--user', 'enable', '--now', 'agent-wiki-meetings.timer']);
+        spawnSync('systemctl', ['--user', update ? 'restart' : 'enable', ...(update ? [] : ['--now']), 'agent-wiki-meetings.timer']);
       });
     }
     console.log((dry ? 'would:\n' : 'done:\n') + (steps.map((x) => `- ${x}`).join('\n') || '- nothing to do'));
@@ -499,8 +540,18 @@ const cmds = {
     }
     const st = loadState();
     const m = st.meetings;
+    // Meetings: the run record is in the vault (shared by all machines); the login and a failure are about this machine.
+    const mvault = cfg.meetings_vault || 'work';
+    const mdir = vaultPath(cfg, mvault);
+    const run = mdir && fs.existsSync(mdir) ? readRun(mdir) : {};
+    if (run.last_run) {
+      console.log(`meetings: last import ${run.last_run} by ${run.machine || '?'} (vault ${mvault}${run.last_meeting_start ? `, read up to meeting at ${run.last_meeting_start}` : ''})`);
+      if (run.claim_by) console.log(`meetings: import running or crashed: claimed by ${run.claim_by} at ${run.claim_at}`);
+    } else if (m?.last_run) console.log(`meetings: last import ok (read from ${m.last_run}), no run record in the vault yet`);
+    else console.log('meetings: no import recorded yet');
     if (m?.failed_at) console.log(`meetings: last import failed ${m.failed_at}: ${m.failed_reason}`);
-    else if (m?.last_run) console.log(`meetings: last import ok (read from ${m.last_run})`);
+    const login = wisprLogin({ prefix: cfg.wispr_tool_prefix, tries: 0 });
+    console.log(`meetings: Wispr login on this machine: ${login.state === 'ok' ? `yes (${login.name}, tools ${login.prefix}*)` : login.state === 'none' ? `no (${login.reason})` : `unknown (${login.error})`}`);
     const errors = Object.entries(st).filter(([, v]) => v.error);
     for (const [k, v] of errors) console.log(`error ${k}: ${v.error}`);
   },
