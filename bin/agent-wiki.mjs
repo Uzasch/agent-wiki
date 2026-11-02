@@ -1,18 +1,30 @@
 #!/usr/bin/env node
 // agent-wiki — capture agent sessions into git-backed OKF vaults.
-import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { loadConfig, saveConfig, resolveVault, rememberFolder, vaultPath, STATE_DIR, expand } from '../lib/config.mjs';
-import { readSession, findSession, listClaudeFiles, listCodexFiles, listAgyFiles, fileMtime, eventsAfter, userTurns, lastEvent, transcriptText } from '../lib/sessions.mjs';
-import { summarise } from '../lib/summarise.mjs';
-import { initVault, writeSessionPage, syncVault } from '../lib/vault.mjs';
-import { listProjects, createProjectPage, organizeVault } from '../lib/projects.mjs';
-import { withLock } from '../lib/lock.mjs';
-import { importClaudeMem } from '../lib/claudemem.mjs';
-import { addImage, pullImages } from '../lib/drive.mjs';
-import { importMeetings } from '../lib/meetings.mjs';
+
+// The prompt hook runs on every user prompt, so it is handled first, before the heavy modules load.
+if (process.argv[2] === 'hook' && /-prompt$/.test(process.argv[3] || '')) {
+  const { promptHook } = await import('../lib/hook.mjs');
+  await promptHook();
+  process.exit(0);
+}
+
+const { spawn, spawnSync } = await import('node:child_process');
+const { fileURLToPath } = await import('node:url');
+const { loadConfig, saveConfig, resolveVault, rememberFolder, vaultPath, STATE_DIR, expand } = await import('../lib/config.mjs');
+const { readSession, findSession, listClaudeFiles, listCodexFiles, listAgyFiles, fileMtime, eventsAfter, userTurns, lastEvent, transcriptText } = await import('../lib/sessions.mjs');
+const { summarise } = await import('../lib/summarise.mjs');
+const { initVault, writeSessionPage, findSessionPage, syncVault, readFrontmatter } = await import('../lib/vault.mjs');
+const { listProjects, createProjectPage, organizeVault } = await import('../lib/projects.mjs');
+const { withLock, withLockAsync } = await import('../lib/lock.mjs');
+const { importClaudeMem } = await import('../lib/claudemem.mjs');
+const { addImage, pullImages } = await import('../lib/drive.mjs');
+const { importMeetings } = await import('../lib/meetings.mjs');
+const { finalizeOutputs, pickImages } = await import('../lib/outputs.mjs');
+const { buildScreenshots } = await import('../lib/screenshots.mjs');
+const { glossaryFor, glossaryForFolders, styleBlock } = await import('../lib/glossary.mjs');
+const { planRenames, applyRenames, renameInState, brokenLinks } = await import('../lib/migrate.mjs');
 
 const SELF = fileURLToPath(import.meta.url);
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
@@ -45,7 +57,7 @@ function flag(args, name) {
 }
 
 // ---------- capture one session ----------
-function capture(s, { force = false, fresh = false } = {}) {
+async function capture(s, { force = false, fresh = false } = {}) {
   const cfg = loadConfig();
   const key = `${s.tool}:${s.id}`;
   if (s.headless && !cfg.include_headless) return { skip: 'headless' };
@@ -65,21 +77,46 @@ function capture(s, { force = false, fresh = false } = {}) {
   const mode = cfg.capture_mode;
   const useFork = !fresh && s.tool !== 'agy' && !coldCache && (mode === 'fork-warm' || (mode === 'fork-long' && long));
   let projects = [];
-  const res = withLock(`session-${key}`, () => {
+  const res = await withLockAsync(`session-${key}`, async () => {
     if (fs.existsSync(dir)) projects = listProjects(dir);
-    const sum = summarise(s, s.events, { since: prev?.at, fallbackModel: cfg.fallback_model, preferFresh: !useFork, projects, allowSkip: userTurns(s) < 5 });
+    const style = styleBlock(glossaryFor(s.cwd, transcriptText(s.events)));
+    const sum = summarise(s, s.events, { since: prev?.at, fallbackModel: cfg.fallback_model, preferFresh: !useFork, projects, allowSkip: userTurns(s) < 5, style });
     if (sum.error) return { error: sum.error };
     const anchor = lastEvent(s)?.id;
     if (sum.skip) { updateState(key, { anchor, at: new Date().toISOString(), skipped: true }); return { skip: 'model said SKIP' }; }
     if (!fs.existsSync(dir)) initVault(dir);
     if (sum.newProject) createProjectPage(dir, sum.newProject);
-    const page = writeSessionPage(dir, s, sum, { machine: cfg.machine, vaultName });
+    // Deterministic outputs: links and NAS paths found in the raw record; screenshots go to Drive when the vault has one.
+    const outputs = s.harvest ? finalizeOutputs(s.harvest) : [];
+    let screenshots = '';
+    if (s.harvest && cfg.vaults[vaultName]?.drive) {
+      try {
+        const old = findSessionPage(dir, s);
+        screenshots = await buildScreenshots({ images: pickImages(s.harvest), vault: cfg.vaults[vaultName], vaultName, vaultDir: dir,
+          session: s, existing: old ? fs.readFileSync(path.join(dir, old), 'utf8') : '', log });
+      } catch (e) { log(`screenshots failed for ${key}: ${String(e.message || e).slice(0, 200)}`); }
+    }
+    const page = writeSessionPage(dir, s, sum, { machine: cfg.machine, vaultName, outputs, screenshots });
     const sync = syncVault(dir, `session: ${sum.title}`.slice(0, 120));
     updateState(key, { anchor, at: new Date().toISOString(), vault: vaultName, page, skipped: false,
       error: sync.ok ? null : sync.error });
-    return { page, vault: vaultName, how: sum.how, cost: sum.cost, cached: sum.cached, sync };
+    return { page, vault: vaultName, how: sum.how, cost: sum.cost, cached: sum.cached, sync, outputs: outputs.length, screenshots: (screenshots.match(/!\[/g) || []).length };
   });
   return res.locked ? { skip: 'already capturing' } : res.value;
+}
+
+// Style rule for the meeting writer: the glossary of the folders mapped to this vault, picked by what the
+// vault's recent pages talk about (a meeting is read inside the model call, so its own text is not known yet).
+function vaultStyle(cfg, name, dir) {
+  try {
+    const folders = Object.entries(cfg.folders).filter(([, v]) => v === name).map(([f]) => expand(f)).filter((f) => fs.existsSync(f));
+    const text = [...listProjects(dir).map((p) => `${p.title} ${p.description}`),
+      ...fs.readdirSync(path.join(dir, 'sessions')).sort().slice(-60).map((f) => {
+        const fm = readFrontmatter(path.join(dir, 'sessions', f));
+        return `${fm.title || ''} ${fm.description || ''}`;
+      })].join('\n');
+    return styleBlock(glossaryForFolders(folders, text, { cap: 6000 }));
+  } catch { return styleBlock(''); }
 }
 
 // Organize one vault, never throw. Logs the result.
@@ -178,13 +215,13 @@ const cmds = {
     } catch (e) { console.error(`drive pull failed: ${e.message}`); process.exit(1); }
   },
 
-  capture(args) {
+  async capture(args) {
     const tool = flag(args, '--tool') || 'claude';
     const id = flag(args, '--id');
     const file = flag(args, '--file');
     const s = file ? readSession(tool, file) : findSession(tool, id);
     if (!s) { console.error('session not found'); process.exit(1); }
-    const r = capture(s, { force: !!flag(args, '--force'), fresh: !!flag(args, '--fresh') });
+    const r = await capture(s, { force: !!flag(args, '--force'), fresh: !!flag(args, '--fresh') });
     log(`capture ${tool}:${s.id} ${JSON.stringify(r)}`);
     console.log(JSON.stringify(r, null, 1));
   },
@@ -203,10 +240,10 @@ const cmds = {
   },
 
   // Every few minutes: capture sessions idle past the limit with new work (covers sleep, Codex, crashes).
-  sweep(args) {
+  async sweep(args) {
     const dry = !!flag(args, '--dry-run');
     const max = Number(flag(args, '--max') || 5);
-    const r = withLock('sweep', () => {
+    const r = await withLockAsync('sweep', async () => {
       const cfg = loadConfig();
       const since = Math.max(installedAt(), Date.now() - 7 * 86400_000);
       const idleMs = cfg.idle_minutes * 60_000;
@@ -231,7 +268,7 @@ const cmds = {
       const lines = [];
       const vaults = new Set();
       for (const s of due.slice(0, max)) {
-        const res = capture(s);
+        const res = await capture(s);
         log(`sweep ${s.tool}:${s.id} ${JSON.stringify(res)}`);
         if (res.page) vaults.add(res.vault);
         lines.push(`${s.tool}:${s.id} ${JSON.stringify(res)}`);
@@ -271,9 +308,14 @@ const cmds = {
       const started = new Date().toISOString();
       const since = typeof sinceFlag === 'string' ? new Date(sinceFlag).toISOString() : loadState().meetings?.last_run;
       if (!fs.existsSync(dir)) initVault(dir);
-      const res = importMeetings(dir, { since, limit, dryRun: dry, model: cfg.fallback_model, log });
-      if (res.error) { log(`meetings ${res.error}`); return res; }
+      const res = importMeetings(dir, { since, limit, dryRun: dry, model: cfg.fallback_model, log, style: vaultStyle(cfg, name, dir) });
+      if (res.error) {
+        log(`meetings ${res.error}`);
+        if (!dry) updateState('meetings', { failed_at: new Date().toISOString(), failed_reason: String(res.error).slice(0, 400) });
+        return res;
+      }
       if (!dry) {
+        updateState('meetings', { failed_at: null, failed_reason: null });
         if (res.pages.length) res.organize = organizeSafe(name);
         res.sync = res.pages.length ? syncVault(dir, `meetings: ${res.pages.length} imported`) : { ok: true, note: 'nothing new' };
         // Overlap by a day: a late-edited meeting is re-read, and dedupe by wispr_id keeps one page.
@@ -301,6 +343,45 @@ const cmds = {
       if (r.changed) syncVault(vaultPath(cfg, n), `organize: ${r.changed} change(s)`);
     }
     if (bad) process.exit(1);
+  },
+
+  // Give old session pages a short title in the file name and fix every link to them.
+  // `migrate-names [--vault <name>] [--dry-run]`
+  'migrate-names'(args) {
+    const dry = !!flag(args, '--dry-run');
+    const vname = flag(args, '--vault');
+    const cfg = loadConfig();
+    const names = typeof vname === 'string' ? [vname] : Object.keys(cfg.vaults);
+    let bad = false;
+    for (const n of names) {
+      const dir = vaultPath(cfg, n);
+      if (!dir || !fs.existsSync(dir)) { console.error(`unknown vault "${n}"`); bad = true; continue; }
+      const plan = planRenames(dir);
+      console.log(`${n}: ${plan.length} session page(s) to rename${dry ? ' (dry run)' : ''}`);
+      for (const { from, to } of plan) console.log(`  ${from} -> ${to}`);
+      if (dry || !plan.length) continue;
+      const before = brokenLinks(dir).length;
+      const r = applyRenames(dir, plan);
+      const st = loadState();
+      renameInState(st, plan);
+      saveState(st);
+      const after = brokenLinks(dir).length;
+      console.log(`${n}: renamed ${r.renamed}, rewrote ${r.links} link(s) in ${r.files} file(s); broken links before ${before}, after ${after}`);
+      if (after > before) { console.error(`${n}: renaming left ${after - before} new broken link(s)`); bad = true; }
+      const sync = syncVault(dir, `rename ${r.renamed} session page(s) to short names`);
+      if (!sync.ok) { console.error(`${n}: sync failed: ${sync.error}`); bad = true; }
+    }
+    if (bad) process.exit(1);
+  },
+
+  // Project glossary entries that match a text (for writers that do not go through capture, e.g. a saved discussion).
+  // `glossary [--cwd DIR] [--file F]` (text from the file, or stdin)
+  glossary(args) {
+    const cwd = flag(args, '--cwd');
+    const file = flag(args, '--file');
+    const text = typeof file === 'string' ? fs.readFileSync(file, 'utf8') : process.stdin.isTTY ? '' : fs.readFileSync(0, 'utf8');   // no --file: read stdin
+    const block = glossaryFor(typeof cwd === 'string' ? cwd : process.cwd(), text);
+    console.log(block || '(no glossary found, or no term from it appears in the text)');
   },
 
   // Wire this machine: personal vault, skills, Claude hook, sweep timer, global read-instruction.
@@ -338,18 +419,37 @@ const cmds = {
     const bin = path.join(home, '.local', 'bin', 'agent-wiki');
     if (!fs.existsSync(bin)) act('link ~/.local/bin/agent-wiki', () => { fs.mkdirSync(path.dirname(bin), { recursive: true }); fs.symlinkSync(SELF, bin); });
 
-    // Claude Code SessionEnd hook.
+    // Claude Code hooks: SessionEnd (capture) and UserPromptSubmit (point the agent at related past pages).
     const settings = path.join(home, '.claude', 'settings.json');
     if (fs.existsSync(settings)) {
       const s = JSON.parse(fs.readFileSync(settings, 'utf8'));
-      const cmd = `node "${SELF}" hook claude-session-end`;
-      const has = JSON.stringify(s.hooks?.SessionEnd || []).includes('agent-wiki');
-      if (!has) act('add Claude SessionEnd hook (backup: settings.json.bak-agent-wiki)', () => {
-        fs.copyFileSync(settings, settings + '.bak-agent-wiki');
-        s.hooks = s.hooks || {};
-        s.hooks.SessionEnd = [...(s.hooks.SessionEnd || []), { hooks: [{ type: 'command', command: cmd, timeout: 10 }] }];
-        fs.writeFileSync(settings, JSON.stringify(s, null, 2) + '\n');
-      });
+      const wanted = [
+        ['SessionEnd', `node "${SELF}" hook claude-session-end`, 10, 'Claude SessionEnd hook'],
+        ['UserPromptSubmit', `node "${SELF}" hook claude-prompt`, 5, 'Claude UserPromptSubmit hook (related past work)'],
+      ];
+      for (const [event, cmd, timeout, label] of wanted) {
+        if (JSON.stringify(s.hooks?.[event] || []).includes('agent-wiki')) continue;
+        act(`add ${label} (backup: settings.json.bak-agent-wiki)`, () => {
+          if (!fs.existsSync(settings + '.bak-agent-wiki')) fs.copyFileSync(settings, settings + '.bak-agent-wiki');
+          s.hooks = s.hooks || {};
+          s.hooks[event] = [...(s.hooks[event] || []), { hooks: [{ type: 'command', command: cmd, timeout }] }];
+          fs.writeFileSync(settings, JSON.stringify(s, null, 2) + '\n');
+        });
+      }
+    }
+
+    // Codex UserPromptSubmit hook: same JSON in and out as Claude's. Codex asks you to trust a new hook once (/hooks).
+    const codexHooks = path.join(home, '.codex', 'hooks.json');
+    if (fs.existsSync(codexHooks)) {
+      const h = JSON.parse(fs.readFileSync(codexHooks, 'utf8'));
+      if (!JSON.stringify(h.hooks?.UserPromptSubmit || []).includes('agent-wiki')) {
+        act('add Codex UserPromptSubmit hook (backup: hooks.json.bak-agent-wiki; Codex asks you to trust it once)', () => {
+          if (!fs.existsSync(codexHooks + '.bak-agent-wiki')) fs.copyFileSync(codexHooks, codexHooks + '.bak-agent-wiki');
+          h.hooks = h.hooks || {};
+          h.hooks.UserPromptSubmit = [...(h.hooks.UserPromptSubmit || []), { hooks: [{ type: 'command', command: `node "${SELF}" hook codex-prompt`, timeout: 5 }] }];
+          fs.writeFileSync(codexHooks, JSON.stringify(h, null, 2) + '\n');
+        });
+      }
     }
 
     // Global "read the wiki" instruction for Claude and Codex.
@@ -397,14 +497,18 @@ const cmds = {
       const ahead = spawnSync('git', ['-C', dir, 'rev-list', '--count', '@{u}..HEAD'], { encoding: 'utf8' });
       console.log(`vault ${n}: ${dir} ${ahead.status === 0 ? `(${ahead.stdout.trim()} commits not pushed)` : ''}`);
     }
-    const errors = Object.entries(loadState()).filter(([, v]) => v.error);
+    const st = loadState();
+    const m = st.meetings;
+    if (m?.failed_at) console.log(`meetings: last import failed ${m.failed_at}: ${m.failed_reason}`);
+    else if (m?.last_run) console.log(`meetings: last import ok (read from ${m.last_run})`);
+    const errors = Object.entries(st).filter(([, v]) => v.error);
     for (const [k, v] of errors) console.log(`error ${k}: ${v.error}`);
   },
 };
 
 const [cmd, ...args] = process.argv.slice(2);
 if (!cmds[cmd]) {
-  console.log('usage: agent-wiki <set|vault|image|drive|meetings|organize|import-claude-mem|capture|hook|sweep|sync|status> …');
+  console.log('usage: agent-wiki <set|vault|image|drive|meetings|organize|migrate-names|glossary|import-claude-mem|capture|hook|sweep|sync|status> …');
   process.exit(cmd ? 1 : 0);
 }
 await cmds[cmd](args);
