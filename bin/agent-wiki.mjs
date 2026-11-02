@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // agent-wiki — capture agent sessions into git-backed OKF vaults.
-import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, saveConfig, resolveVault, rememberFolder, vaultPath, STATE_DIR, expand } from '../lib/config.mjs';
 import { readSession, findSession, listClaudeFiles, listCodexFiles, listAgyFiles, fileMtime, eventsAfter, userTurns, lastEvent, transcriptText } from '../lib/sessions.mjs';
@@ -13,6 +13,7 @@ import { withLock } from '../lib/lock.mjs';
 import { importClaudeMem } from '../lib/claudemem.mjs';
 import { addImage, pullImages } from '../lib/drive.mjs';
 import { importMeetings } from '../lib/meetings.mjs';
+import { finalizeOutputs } from '../lib/outputs.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
@@ -73,11 +74,13 @@ function capture(s, { force = false, fresh = false } = {}) {
     if (sum.skip) { updateState(key, { anchor, at: new Date().toISOString(), skipped: true }); return { skip: 'model said SKIP' }; }
     if (!fs.existsSync(dir)) initVault(dir);
     if (sum.newProject) createProjectPage(dir, sum.newProject);
-    const page = writeSessionPage(dir, s, sum, { machine: cfg.machine, vaultName });
+    // Deterministic outputs: links and NAS paths found in the raw record.
+    const outputs = s.harvest ? finalizeOutputs(s.harvest) : [];
+    const page = writeSessionPage(dir, s, sum, { machine: cfg.machine, vaultName, outputs });
     const sync = syncVault(dir, `session: ${sum.title}`.slice(0, 120));
     updateState(key, { anchor, at: new Date().toISOString(), vault: vaultName, page, skipped: false,
       error: sync.ok ? null : sync.error });
-    return { page, vault: vaultName, how: sum.how, cost: sum.cost, cached: sum.cached, sync };
+    return { page, vault: vaultName, how: sum.how, cost: sum.cost, cached: sum.cached, sync, outputs: outputs.length };
   });
   return res.locked ? { skip: 'already capturing' } : res.value;
 }
